@@ -1,0 +1,14 @@
+data_patients
+TransUNet
+
+old_checkpoints
+
+model
+.idea
+.vscode
+__pycache__
+
+.DS_Store
+
+checkpoints/
+outputs/
