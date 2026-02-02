@@ -26,10 +26,10 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # ================= SAMPLE SLICE CONFIG =================
 PATIENT_SLICE_MAP = {
-    "Patient 17": 40,
-    "Patient 18": 67,
-    "Patient 19": 58,
-    "Patient 20": 153
+    "Patient 17": -1,
+    "Patient 18": -2,
+    "Patient 19": -3,
+    "Patient 20": -4
 }
 # ======================================================
 
@@ -93,7 +93,7 @@ def infer_patient(patient_name, model):
 
     patient_dir = os.path.join(DATA_ROOT, patient_name)
     img_dir = os.path.join(patient_dir, "CT")
-    mask_dir = os.path.join(patient_dir, "Liver_cc_clean")
+    mask_dir = os.path.join(patient_dir, "Liver")
 
     if not os.path.isdir(img_dir):
         print("  No CT folder found, skipping.")
@@ -136,49 +136,50 @@ def infer_patient(patient_name, model):
 
         with torch.no_grad():
             prob = torch.sigmoid(model(img_t))[0, 0].cpu().numpy()
-
-        # ===== STABLE ADAPTIVE + FALLBACK THRESHOLDING =====
+        
+        # ===== 1. Thresholding =====
         if prob.max() < 0.5:
-             # very low confidence slice → simple threshold
-             pred = (prob > LOW_THRESHOLD).astype(np.uint8)
+            pred = (prob > LOW_THRESHOLD).astype(np.uint8)
         else:
-    
-            # ---- ADAPTIVE THRESHOLDING ----
             nonzero = prob[prob > 0.1]
-            if len(nonzero) > 0:
-                adaptive_low = max(np.percentile(nonzero, 55), LOW_THRESHOLD)
-            else:
-                adaptive_low = LOW_THRESHOLD
+            adaptive_low = max(np.percentile(nonzero, 50), LOW_THRESHOLD) if len(nonzero) > 0 else LOW_THRESHOLD
 
             pred_low  = (prob > adaptive_low).astype(np.uint8)
             pred_high = (prob > HIGH_THRESHOLD).astype(np.uint8)
-        
 
             labeled, _ = ndi.label(pred_low)
             pred = np.zeros_like(pred_low)
 
             for lab in np.unique(labeled):
                 if lab == 0:
-                   continue
+                    continue
                 if np.any(pred_high[labeled == lab]):
                     pred[labeled == lab] = 1
 
-        # ---- morphology ----
-        pred = ndi.binary_fill_holes(pred)
-        pred = ndi.binary_closing(pred, structure=np.ones((3, 3)))
 
-        # ---- FORCE SINGLE LIVER COMPONENT ----
+        # ===== 2. LOW-CONFIDENCE SLICE GUARD (VERY IMPORTANT) =====
+        if prob.max() < 0.25 and prob.mean() < 0.10:
+            pred[:] = 0
+
+
+        # ===== 3. MORPHOLOGY (shape repair) =====
+        pred = ndi.binary_fill_holes(pred)
+        pred = ndi.binary_closing(pred, structure=np.ones((5, 5)))
+
+
+        # ===== 4. FORCE SINGLE LIVER =====
         labeled, num = ndi.label(pred)
         if num > 1:
             sizes = ndi.sum(pred, labeled, range(1, num + 1))
-            largest = sizes.argmax() + 1
-            pred = (labeled == largest).astype(np.uint8)
-        
-        # ---- MIN AREA FILTER (LAST) ----
-        min_area = 0.001 * (IMG_SIZE * IMG_SIZE)
+            pred = (labeled == (sizes.argmax() + 1)).astype(np.uint8)
+
+
+        # ===== 5. MIN AREA FILTER =====
+        min_area = 0.002 * (IMG_SIZE * IMG_SIZE)
         if pred.sum() < min_area:
             pred[:] = 0
 
+       
         # -------- SAVE VIS --------
         fig, axes = plt.subplots(1, 3, figsize=(9, 3))
 
@@ -213,7 +214,7 @@ def save_sample_figure(model):
     for row, (patient_name, slice_idx) in enumerate(PATIENT_SLICE_MAP.items()):
         patient_dir = os.path.join(DATA_ROOT, patient_name)
         img_dir = os.path.join(patient_dir, "CT")
-        mask_dir = os.path.join(patient_dir, "Liver_cc_clean")
+        mask_dir = os.path.join(patient_dir, "Liver")
 
         img_files = [f for f in os.listdir(img_dir)
              if f.lower().endswith((".jpg", ".png", ".jpeg"))]
@@ -237,7 +238,7 @@ def save_sample_figure(model):
             print(f"⚠️ Slice index {slice_idx} out of range for {patient_name}")
             continue
 
-        sid = common_ids[slice_idx]
+        sid = common_ids[slice_idx % len(common_ids)]
 
         img_path = os.path.join(img_dir, img_map[sid])
         mask_path = os.path.join(mask_dir, mask_map[sid])
@@ -249,12 +250,13 @@ def save_sample_figure(model):
             prob = torch.sigmoid(model(img_t))[0, 0].cpu().numpy()
 
         # ===== STABLE ADAPTIVE + FALLBACK THRESHOLDING =====
+        
         if prob.max() < 0.5:
             pred = (prob > LOW_THRESHOLD).astype(np.uint8)
         else:
             nonzero = prob[prob > 0.1]
             if len(nonzero) > 0:
-                adaptive_low = max(np.percentile(nonzero, 55), LOW_THRESHOLD)
+                adaptive_low = max(np.percentile(nonzero, 50), LOW_THRESHOLD)
             else:
                 adaptive_low = LOW_THRESHOLD
 
@@ -298,9 +300,10 @@ def save_sample_figure(model):
 
     plt.tight_layout()
     plt.savefig("outputs/sample_results.png", dpi=300)
+    plt.show()
     plt.close()
 
-    print("✅ Saved fixed sample figure: outputs/sample_results.png")    
+    print("✅ Sample image saved at outputs/sample_results.png")    
 
 # ===================== MAIN =====================
 

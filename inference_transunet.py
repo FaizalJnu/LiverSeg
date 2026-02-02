@@ -26,10 +26,10 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # ================= SAMPLE SLICE CONFIG =================
 PATIENT_SLICE_MAP = {
-    "Patient 17": 40,
-    "Patient 18": 67,
-    "Patient 19": 58,
-    "Patient 20": 153
+    "Patient 17": 26,
+    "Patient 18": 27,
+    "Patient 19": 50,
+    "Patient 20": 37
 }
 # ======================================================
 
@@ -62,6 +62,17 @@ def pad_resize_pil(img, size=224, is_mask=False):
     new_img.paste(img, (paste_x, paste_y))
 
     return new_img
+
+
+def post_process(mask):
+    """Keep only the largest connected component."""
+    labeled, num = ndi.label(mask)
+    if num == 0:
+        return mask
+
+    sizes = ndi.sum(mask, labeled, range(1, num + 1))
+    largest = sizes.argmax() + 1
+    return (labeled == largest).astype(np.uint8)
 
 
 def load_slice(img_path, mask_path=None):
@@ -137,45 +148,23 @@ def infer_patient(patient_name, model):
         with torch.no_grad():
             prob = torch.sigmoid(model(img_t))[0, 0].cpu().numpy()
 
-        # ===== STABLE ADAPTIVE + FALLBACK THRESHOLDING =====
-        if prob.max() < 0.5:
-             # very low confidence slice → simple threshold
-             pred = (prob > LOW_THRESHOLD).astype(np.uint8)
-        else:
-    
-            # ---- ADAPTIVE THRESHOLDING ----
-            nonzero = prob[prob > 0.1]
-            if len(nonzero) > 0:
-                adaptive_low = max(np.percentile(nonzero, 55), LOW_THRESHOLD)
-            else:
-                adaptive_low = LOW_THRESHOLD
+        # ===== DUAL THRESHOLD LOGIC =====
+        pred_low  = (prob > LOW_THRESHOLD).astype(np.uint8)
+        pred_high = (prob > HIGH_THRESHOLD).astype(np.uint8)
 
-            pred_low  = (prob > adaptive_low).astype(np.uint8)
-            pred_high = (prob > HIGH_THRESHOLD).astype(np.uint8)
-        
+        labeled, _ = ndi.label(pred_low)
+        pred = np.zeros_like(pred_low)
 
-            labeled, _ = ndi.label(pred_low)
-            pred = np.zeros_like(pred_low)
+        for lab in np.unique(labeled):
+            if lab == 0:
+                continue
+            if np.any(pred_high[labeled == lab]):
+                pred[labeled == lab] = 1
 
-            for lab in np.unique(labeled):
-                if lab == 0:
-                   continue
-                if np.any(pred_high[labeled == lab]):
-                    pred[labeled == lab] = 1
-
-        # ---- morphology ----
         pred = ndi.binary_fill_holes(pred)
         pred = ndi.binary_closing(pred, structure=np.ones((3, 3)))
 
-        # ---- FORCE SINGLE LIVER COMPONENT ----
-        labeled, num = ndi.label(pred)
-        if num > 1:
-            sizes = ndi.sum(pred, labeled, range(1, num + 1))
-            largest = sizes.argmax() + 1
-            pred = (labeled == largest).astype(np.uint8)
-        
-        # ---- MIN AREA FILTER (LAST) ----
-        min_area = 0.001 * (IMG_SIZE * IMG_SIZE)
+        min_area = 0.005 * (IMG_SIZE * IMG_SIZE)
         if pred.sum() < min_area:
             pred[:] = 0
 
@@ -248,27 +237,18 @@ def save_sample_figure(model):
         with torch.no_grad():
             prob = torch.sigmoid(model(img_t))[0, 0].cpu().numpy()
 
-        # ===== STABLE ADAPTIVE + FALLBACK THRESHOLDING =====
-        if prob.max() < 0.5:
-            pred = (prob > LOW_THRESHOLD).astype(np.uint8)
-        else:
-            nonzero = prob[prob > 0.1]
-            if len(nonzero) > 0:
-                adaptive_low = max(np.percentile(nonzero, 55), LOW_THRESHOLD)
-            else:
-                adaptive_low = LOW_THRESHOLD
+        # ===== SAME DUAL-THRESHOLD LOGIC AS INFERENCE =====
+        pred_low  = (prob > LOW_THRESHOLD).astype(np.uint8)
+        pred_high = (prob > HIGH_THRESHOLD).astype(np.uint8)
 
-            pred_low  = (prob > adaptive_low).astype(np.uint8)
-            pred_high = (prob > HIGH_THRESHOLD).astype(np.uint8)
+        labeled, _ = ndi.label(pred_low)
+        pred = np.zeros_like(pred_low)
 
-            labeled, _ = ndi.label(pred_low)
-            pred = np.zeros_like(pred_low)
-
-            for lab in np.unique(labeled):
-                if lab == 0:
-                    continue
-                if np.any(pred_high[labeled == lab]):
-                    pred[labeled == lab] = 1
+        for lab in np.unique(labeled):
+            if lab == 0:
+                continue
+            if np.any(pred_high[labeled == lab]):
+                pred[labeled == lab] = 1
 
         # fill holes
         pred = ndi.binary_fill_holes(pred)
@@ -278,11 +258,11 @@ def save_sample_figure(model):
 
         # remove tiny false positives
         pred = pred.astype(np.uint8)
-        min_area = 0.001 * (IMG_SIZE * IMG_SIZE)
+        min_area = 0.003 * (IMG_SIZE * IMG_SIZE)
         if pred.sum() < min_area:
             pred[:] = 0
         # =================================================
-        
+
         # ---- Plot ----
         axes[row, 0].imshow(img_np, cmap="gray")
         axes[row, 0].set_title(f"{patient_name} - CT")
