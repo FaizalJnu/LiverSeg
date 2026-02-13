@@ -17,19 +17,18 @@ OUT_DIR = "outputs/inference_results"
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cuda")
 print("Using device:", DEVICE)
 
-IMG_SIZE = 224
-LOW_THRESHOLD = 0.35
-HIGH_THRESHOLD = 0.65
+IMG_SIZE = 512
+
 
 os.makedirs(OUT_DIR, exist_ok=True)
 # ==============================================
 
 # ================= SAMPLE SLICE CONFIG =================
 PATIENT_SLICE_MAP = {
-    "Patient 17": 26,
-    "Patient 18": 27,
-    "Patient 19": 50,
-    "Patient 20": 37
+    "Patient 17": 40,
+    "Patient 18": 67,
+    "Patient 19": 58,
+    "Patient 20": 153
 }
 # ======================================================
 
@@ -45,57 +44,25 @@ def numeric_sort_key(filename):
     return int(nums[0]) if nums else 0
 
 
-def pad_resize_pil(img, size=224, is_mask=False):
-    """Aspect-ratio preserving resize + padding (same as training)."""
-    w, h = img.size
-    scale = size / max(w, h)
-    new_w, new_h = int(w * scale), int(h * scale)
-
-    img = img.resize(
-        (new_w, new_h),
-        Image.NEAREST if is_mask else Image.BILINEAR
-    )
-
-    new_img = Image.new("L", (size, size))
-    paste_x = (size - new_w) // 2
-    paste_y = (size - new_h) // 2
-    new_img.paste(img, (paste_x, paste_y))
-
-    return new_img
-
-
-def post_process(mask):
-    """Keep only the largest connected component."""
-    labeled, num = ndi.label(mask)
-    if num == 0:
-        return mask
-
-    sizes = ndi.sum(mask, labeled, range(1, num + 1))
-    largest = sizes.argmax() + 1
-    return (labeled == largest).astype(np.uint8)
-
-
 def load_slice(img_path, mask_path=None):
-    """Load and preprocess one CT slice (+ GT if available)."""
     img = Image.open(img_path).convert("L")
-    img = pad_resize_pil(img, IMG_SIZE, is_mask=False)
-    img_np = np.array(img, dtype=np.float32) / 255.0
+    img_np = np.array(img, dtype=np.float32) / 255.0  # already 512x512
 
     if mask_path is not None and os.path.exists(mask_path):
         mask = Image.open(mask_path).convert("L")
-        mask = pad_resize_pil(mask, IMG_SIZE, is_mask=True)
-        
-        mask_np = (np.array(mask) > 128).astype(np.uint8) 
+        mask_np = (np.array(mask) > 128).astype(np.uint8)
     else:
         mask_np = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint8)
 
-    img_t = torch.tensor(img_np).unsqueeze(0).unsqueeze(0)
+    img_t = torch.from_numpy(img_np).float().unsqueeze(0).unsqueeze(0)  # (1,1,512,512)
     return img_t, mask_np, img_np
 
 
 def slice_id(name):
     nums = re.findall(r"\d+", name)
-    return nums[-1] if nums else None
+    if not nums:
+        return None
+    return str(int(nums[-1]))   # normalize 040 → "40"
 
 # ============== INFERENCE LOGIC =================
 
@@ -104,7 +71,7 @@ def infer_patient(patient_name, model):
 
     patient_dir = os.path.join(DATA_ROOT, patient_name)
     img_dir = os.path.join(patient_dir, "CT")
-    mask_dir = os.path.join(patient_dir, "Liver_cc_clean")
+    mask_dir = os.path.join(patient_dir, "Liver")
 
     if not os.path.isdir(img_dir):
         print("  No CT folder found, skipping.")
@@ -115,7 +82,7 @@ def infer_patient(patient_name, model):
                  if f.lower().endswith((".jpg", ".png", ".jpeg"))]
 
     mask_files = [f for f in os.listdir(mask_dir)
-                  if f.lower().endswith(".png")]
+                   if f.lower().endswith((".png", ".jpg", ".jpeg"))]
 
     img_map = {}
     for f in img_files:
@@ -129,7 +96,10 @@ def infer_patient(patient_name, model):
         if sid is not None and sid not in mask_map:
             mask_map[sid] = f
 
-    common_ids = sorted(set(img_map.keys()) & set(mask_map.keys()))
+    common_ids = sorted(
+         set(img_map.keys()) & set(mask_map.keys()),
+         key=lambda x: int(x)
+    )
 
     if len(common_ids) == 0:
         print("  ❌ No matching slices found.")
@@ -148,26 +118,11 @@ def infer_patient(patient_name, model):
         with torch.no_grad():
             prob = torch.sigmoid(model(img_t))[0, 0].cpu().numpy()
 
-        # ===== DUAL THRESHOLD LOGIC =====
-        pred_low  = (prob > LOW_THRESHOLD).astype(np.uint8)
-        pred_high = (prob > HIGH_THRESHOLD).astype(np.uint8)
-
-        labeled, _ = ndi.label(pred_low)
-        pred = np.zeros_like(pred_low)
-
-        for lab in np.unique(labeled):
-            if lab == 0:
-                continue
-            if np.any(pred_high[labeled == lab]):
-                pred[labeled == lab] = 1
-
+        pred = (prob > 0.5).astype(np.uint8)
+        # ---- morphology ----
         pred = ndi.binary_fill_holes(pred)
         pred = ndi.binary_closing(pred, structure=np.ones((3, 3)))
-
-        min_area = 0.005 * (IMG_SIZE * IMG_SIZE)
-        if pred.sum() < min_area:
-            pred[:] = 0
-
+    
         # -------- SAVE VIS --------
         fig, axes = plt.subplots(1, 3, figsize=(9, 3))
 
@@ -202,12 +157,12 @@ def save_sample_figure(model):
     for row, (patient_name, slice_idx) in enumerate(PATIENT_SLICE_MAP.items()):
         patient_dir = os.path.join(DATA_ROOT, patient_name)
         img_dir = os.path.join(patient_dir, "CT")
-        mask_dir = os.path.join(patient_dir, "Liver_cc_clean")
+        mask_dir = os.path.join(patient_dir, "Liver")
 
         img_files = [f for f in os.listdir(img_dir)
-             if f.lower().endswith((".jpg", ".png", ".jpeg"))]
+              if f.lower().endswith((".jpg", ".png", ".jpeg"))]
         mask_files = [f for f in os.listdir(mask_dir)
-              if f.lower().endswith(".png")]
+              if f.lower().endswith((".png", ".jpg", ".jpeg"))]
 
         img_map = {}
         for f in img_files:
@@ -221,12 +176,17 @@ def save_sample_figure(model):
             if sid is not None and sid not in mask_map:
                 mask_map[sid] = f
 
-        common_ids = sorted(set(img_map.keys()) & set(mask_map.keys()))
-        if slice_idx >= len(common_ids):
-            print(f"⚠️ Slice index {slice_idx} out of range for {patient_name}")
-            continue
+        
+        common_ids = sorted(
+             set(img_map.keys()) & set(mask_map.keys()),
+             key=lambda x: int(x)
+        )
 
-        sid = common_ids[slice_idx]
+        sid = str(slice_idx)   # slice number, NOT index
+
+        if sid not in common_ids:
+            print(f"⚠️ Slice {slice_idx} not found for {patient_name}")
+            continue
 
         img_path = os.path.join(img_dir, img_map[sid])
         mask_path = os.path.join(mask_dir, mask_map[sid])
@@ -236,33 +196,18 @@ def save_sample_figure(model):
 
         with torch.no_grad():
             prob = torch.sigmoid(model(img_t))[0, 0].cpu().numpy()
-
-        # ===== SAME DUAL-THRESHOLD LOGIC AS INFERENCE =====
-        pred_low  = (prob > LOW_THRESHOLD).astype(np.uint8)
-        pred_high = (prob > HIGH_THRESHOLD).astype(np.uint8)
-
-        labeled, _ = ndi.label(pred_low)
-        pred = np.zeros_like(pred_low)
-
-        for lab in np.unique(labeled):
-            if lab == 0:
-                continue
-            if np.any(pred_high[labeled == lab]):
-                pred[labeled == lab] = 1
-
+        pred = (prob > 0.5).astype(np.uint8)
         # fill holes
         pred = ndi.binary_fill_holes(pred)
 
         # smooth boundaries
-        pred = ndi.binary_closing(pred, structure=np.ones((3, 3)))
+        pred = ndi.binary_closing(pred, structure=np.ones((2, 2)))
 
         # remove tiny false positives
         pred = pred.astype(np.uint8)
-        min_area = 0.003 * (IMG_SIZE * IMG_SIZE)
-        if pred.sum() < min_area:
-            pred[:] = 0
+        
         # =================================================
-
+        
         # ---- Plot ----
         axes[row, 0].imshow(img_np, cmap="gray")
         axes[row, 0].set_title(f"{patient_name} - CT")
@@ -292,7 +237,8 @@ if __name__ == "__main__":
     config_vit = CONFIGS_ViT_seg["R50-ViT-B_16"]
     config_vit.n_classes = 1
     config_vit.n_skip = 3
-    config_vit.patches.grid = (IMG_SIZE // 16, IMG_SIZE // 16)
+    config_vit.in_channels = 1
+    config_vit.patches.grid =(32, 32)  # 512 / 16
 
     model = TransUNet(
         config=config_vit,
